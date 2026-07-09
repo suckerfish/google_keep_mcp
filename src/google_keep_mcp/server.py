@@ -1,4 +1,6 @@
 import argparse
+import datetime
+import itertools
 import json
 import logging
 import os
@@ -73,6 +75,28 @@ def _sync() -> None:
     _save_state()
 
 
+def _blob_to_dict(blob: gkeepapi.node.Blob) -> dict[str, Any]:
+    """Serialize an attachment's metadata (no URL — that requires a separate network call)."""
+    inner = blob.blob
+    result: dict[str, Any] = {"id": blob.id}
+
+    if isinstance(inner, gkeepapi.node.NodeImage):
+        result["type"] = "image"
+        result["width"] = inner.width
+        result["height"] = inner.height
+        result["extracted_text"] = inner.extracted_text or ""
+    elif isinstance(inner, gkeepapi.node.NodeDrawing):
+        result["type"] = "drawing"
+        result["extracted_text"] = inner.extracted_text or ""
+    elif isinstance(inner, gkeepapi.node.NodeAudio):
+        result["type"] = "audio"
+        result["length_seconds"] = inner.length
+    else:
+        result["type"] = "unknown"
+
+    return result
+
+
 def _note_to_dict(note: gkeepapi.node.TopLevelNode) -> dict[str, Any]:
     """Serialize a note/list to a dictionary."""
     result: dict[str, Any] = {
@@ -85,6 +109,10 @@ def _note_to_dict(note: gkeepapi.node.TopLevelNode) -> dict[str, Any]:
         "trashed": note.trashed,
         "url": note.url,
         "labels": [label.name for label in note.labels.all()],
+        "created": note.timestamps.created.isoformat(),
+        "updated": note.timestamps.updated.isoformat(),
+        "edited": note.timestamps.edited.isoformat(),
+        "attachments": [_blob_to_dict(b) for b in note.blobs],
     }
 
     if isinstance(note, gkeepapi.node.List):
@@ -100,6 +128,17 @@ def _note_to_dict(note: gkeepapi.node.TopLevelNode) -> dict[str, Any]:
         result["text"] = note.text or ""
 
     return result
+
+
+def _parse_date(value: str) -> datetime.datetime:
+    """Parse an ISO 8601 date/datetime string, assuming UTC if no timezone given."""
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+    except ValueError as e:
+        raise ValueError(f"Invalid date '{value}': {e}")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
 
 
 COLOR_MAP = {c.name.lower(): c for c in ColorValue}
@@ -120,6 +159,14 @@ def _parse_color(color: str) -> ColorValue:
 # ---------------------------------------------------------------------------
 
 
+SORT_KEYS = {
+    "created": lambda n: n.timestamps.created,
+    "updated": lambda n: n.timestamps.updated,
+    "edited": lambda n: n.timestamps.edited,
+    "title": lambda n: n.title.lower(),
+}
+
+
 @mcp.tool()
 def search_notes(
     query: str = "",
@@ -128,6 +175,13 @@ def search_notes(
     pinned: bool | None = None,
     archived: bool | None = None,
     trashed: bool = False,
+    created_after: str | None = None,
+    created_before: str | None = None,
+    updated_after: str | None = None,
+    updated_before: str | None = None,
+    sort_by: str | None = None,
+    sort_desc: bool = True,
+    offset: int = 0,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     """Search Google Keep notes and lists.
@@ -139,6 +193,14 @@ def search_notes(
         pinned: Filter by pinned status.
         archived: Filter by archived status.
         trashed: Include trashed notes.
+        created_after: ISO 8601 date/datetime; only notes created at or after this.
+        created_before: ISO 8601 date/datetime; only notes created at or before this.
+        updated_after: ISO 8601 date/datetime; only notes updated at or after this.
+        updated_before: ISO 8601 date/datetime; only notes updated at or before this.
+        sort_by: Sort by "created", "updated", "edited", or "title". Unsorted
+            (arbitrary internal order) if omitted.
+        sort_desc: Sort descending (newest/Z-first) when sort_by is set. Default True.
+        offset: Number of results to skip (for paging through large result sets).
         limit: Maximum number of results to return.
     """
     keep = _get_keep()
@@ -168,7 +230,27 @@ def search_notes(
         trashed=trashed,
     )
 
-    return [_note_to_dict(n) for _, n in zip(range(limit), results)]
+    if created_after is not None:
+        dt = _parse_date(created_after)
+        results = (n for n in results if n.timestamps.created >= dt)
+    if created_before is not None:
+        dt = _parse_date(created_before)
+        results = (n for n in results if n.timestamps.created <= dt)
+    if updated_after is not None:
+        dt = _parse_date(updated_after)
+        results = (n for n in results if n.timestamps.updated >= dt)
+    if updated_before is not None:
+        dt = _parse_date(updated_before)
+        results = (n for n in results if n.timestamps.updated <= dt)
+
+    if sort_by is not None:
+        if sort_by not in SORT_KEYS:
+            raise ValueError(
+                f"Unknown sort_by '{sort_by}'. Valid options: {', '.join(SORT_KEYS.keys())}"
+            )
+        results = sorted(results, key=SORT_KEYS[sort_by], reverse=sort_desc)
+
+    return [_note_to_dict(n) for n in itertools.islice(results, offset, offset + limit)]
 
 
 @mcp.tool()
@@ -183,6 +265,29 @@ def get_note(note_id: str) -> dict[str, Any]:
     if note is None:
         raise ValueError(f"Note not found: {note_id}")
     return _note_to_dict(note)
+
+
+@mcp.tool()
+def get_attachment_url(note_id: str, attachment_id: str) -> str:
+    """Resolve a fetchable URL for one of a note's attachments (image/drawing/audio).
+
+    Makes a live network call to Google, so only call this for a specific
+    attachment you actually need — not in a loop over search results.
+
+    Args:
+        note_id: The ID of the note the attachment belongs to.
+        attachment_id: The attachment's ID, from the note's "attachments" list.
+    """
+    keep = _get_keep()
+    note = keep.get(note_id)
+    if note is None:
+        raise ValueError(f"Note not found: {note_id}")
+
+    for blob in note.blobs:
+        if blob.id == attachment_id:
+            return keep.getMediaLink(blob)
+
+    raise ValueError(f"Attachment not found: {attachment_id}")
 
 
 @mcp.tool()
@@ -349,6 +454,62 @@ def delete_note(note_id: str) -> str:
     note.delete()
     _sync()
     return f"Note '{note.title}' permanently deleted."
+
+
+@mcp.tool()
+def bulk_update_notes(
+    note_ids: list[str],
+    trashed: bool | None = None,
+    archived: bool | None = None,
+    pinned: bool | None = None,
+    add_label: str | None = None,
+    remove_label: str | None = None,
+) -> list[dict[str, Any]]:
+    """Apply the same change(s) to multiple notes in a single sync.
+
+    Does not support permanent deletion — trash notes in bulk here, then use
+    delete_note individually once you're sure.
+
+    Args:
+        note_ids: IDs of the notes to update.
+        trashed: If set, trash (True) or restore (False) all notes.
+        archived: If set, archive (True) or unarchive (False) all notes.
+        pinned: If set, pin (True) or unpin (False) all notes.
+        add_label: Label name to add to all notes (created if it doesn't exist).
+        remove_label: Label name to remove from all notes.
+    """
+    keep = _get_keep()
+
+    notes = []
+    for note_id in note_ids:
+        note = keep.get(note_id)
+        if note is None:
+            raise ValueError(f"Note not found: {note_id}")
+        notes.append(note)
+
+    add_label_obj = keep.findLabel(add_label, create=True) if add_label else None
+    remove_label_obj = None
+    if remove_label:
+        remove_label_obj = keep.findLabel(remove_label)
+        if remove_label_obj is None:
+            raise ValueError(f"Label not found: {remove_label}")
+
+    for note in notes:
+        if trashed is True:
+            note.trash()
+        elif trashed is False:
+            note.untrash()
+        if archived is not None:
+            note.archived = archived
+        if pinned is not None:
+            note.pinned = pinned
+        if add_label_obj is not None:
+            note.labels.add(add_label_obj)
+        if remove_label_obj is not None:
+            note.labels.remove(remove_label_obj)
+
+    _sync()
+    return [_note_to_dict(n) for n in notes]
 
 
 # ---------------------------------------------------------------------------

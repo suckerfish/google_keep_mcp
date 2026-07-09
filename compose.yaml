@@ -1,0 +1,24 @@
+services:
+  google-keep-mcp:
+    image: ghcr.io/suckerfish/google_keep_mcp:latest
+    container_name: google-keep-mcp
+    environment:
+      - GOOGLE_KEEP_EMAIL=${GOOGLE_KEEP_EMAIL}
+      - GOOGLE_KEEP_MASTER_TOKEN=${GOOGLE_KEEP_MASTER_TOKEN}
+      - GOOGLE_KEEP_DEVICE_ID=${GOOGLE_KEEP_DEVICE_ID}
+      - GOOGLE_KEEP_STATE_PATH=/data/state.json
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - keep-state:/data
+    ports:
+      - "${PORT:-8082}:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  keep-state:

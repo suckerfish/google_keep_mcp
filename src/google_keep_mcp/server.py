@@ -55,9 +55,17 @@ def _get_keep() -> gkeepapi.Keep:
         with open(_state_path) as f:
             saved_state = json.load(f)
 
-    keep.authenticate(email, master_token, state=saved_state, device_id=device_id)
+    try:
+        keep.authenticate(email, master_token, state=saved_state, device_id=device_id)
+    except gkeepapi.exception.ResyncRequiredException:
+        # The saved state is too old for an incremental sync. Without this,
+        # every restart reloads the same stale file and fails the same way.
+        logger.warning("Saved Keep state is stale; discarding it and doing a full sync")
+        keep = gkeepapi.Keep()
+        keep.authenticate(email, master_token, device_id=device_id)
 
     _keep = keep
+    _save_state()
     return _keep
 
 
@@ -71,7 +79,21 @@ def _save_state() -> None:
 def _sync() -> None:
     """Sync changes with Google servers and persist state."""
     keep = _get_keep()
-    keep.sync()
+    try:
+        keep.sync()
+    except gkeepapi.exception.ResyncRequiredException:
+        # Google asked for a full resync. A resync clears the local tree, so
+        # any change made by the current tool call is lost and must be retried.
+        had_local_changes = bool(keep._findDirtyNodes())
+        logger.warning("Google requested a full resync; resyncing")
+        keep.sync(resync=True)
+        _save_state()
+        if had_local_changes:
+            raise RuntimeError(
+                "Google Keep required a full resync, which discarded this change. "
+                "The local state is now fresh; retry the operation."
+            ) from None
+        return
     _save_state()
 
 
